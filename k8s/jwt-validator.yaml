@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jwt-validator
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: jwt-validator
+  template:
+    metadata:
+      labels:
+        app: jwt-validator
+    spec:
+      containers:
+      - name: jwt-validator
+        image: node:18-slim
+        command: ["/bin/sh", "-c"]
+        args:
+        - "mkdir -p /app && cp /app-config/* /app/ && npm install --prefix /app && node /app/index.js"
+        volumeMounts:
+        - name: config
+          mountPath: /app-config
+          readOnly: true
+        ports:
+        - containerPort: 3000
+      volumes:
+      - name: config
+        configMap:
+          name: jwt-validator-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jwt-validator
+  namespace: default
+spec:
+  selector:
+    app: jwt-validator
+  ports:
+  - port: 3000
+    targetPort: 3000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jwt-validator-config
+  namespace: default
+data:
+  index.js: |
+    const http = require('http');
+    const jwt = require('jsonwebtoken');
+    const jwksClient = require('jwks-rsa');
+
+    // Force unbuffered output
+    process.stdout.setMaxListeners(0);
+    const log = (...args) => process.stdout.write(`[${new Date().toISOString()}] ${args.join(' ')}\n`);
+
+    log('Starting JWT Validator setup...');
+    const client = jwksClient({
+      jwksUri: 'https://cognito-idp.eu-central-1.amazonaws.com/eu-central-1_QYxWEOkrE/.well-known/jwks.json',
+      cache: true,
+      rateLimit: true,
+      jwksRequestsPerMinute: 5
+    });
+    log('JWKS client initialized with URI: https://cognito-idp.eu-central-1.amazonaws.com/eu-central-1_QYxWEOkrE/.well-known/jwks.json');
+
+    function getKey(header, callback) {
+      log('Fetching signing key for kid:', header.kid);
+      client.getSigningKey(header.kid, (err, key) => {
+        if (err) {
+          log('Error fetching signing key:', err.message);
+          callback(err);
+        } else if (!key) {
+          log('No key found for kid:', header.kid);
+          callback(new Error('No matching key found in JWKS'));
+        } else {
+          const signingKey = key.getPublicKey();
+          log('Successfully fetched signing key for kid:', header.kid);
+          callback(null, signingKey);
+        }
+      });
+    }
+
+    const server = http.createServer((req, res) => {
+      log('Received request from:', req.socket.remoteAddress);
+      const authHeader = req.headers['authorization'] || '';
+      log('Authorization header:', authHeader);
+
+      if (!authHeader) {
+        log('No Authorization header present');
+        res.writeHead(401, { 'WWW-Authenticate': 'Bearer' });
+        res.end('Missing Authorization header');
+        return;
+      }
+
+      if (!authHeader.startsWith('Bearer ')) {
+        log('Invalid Authorization header format');
+        res.writeHead(401, { 'WWW-Authenticate': 'Bearer' });
+        res.end('Missing or invalid Bearer token');
+        return;
+      }
+
+      const token = authHeader.split(' ')[1];
+      if (!token) {
+        log('Bearer token is empty');
+        res.writeHead(401, { 'WWW-Authenticate': 'Bearer' });
+        res.end('Bearer token required');
+        return;
+      }
+
+      log('Extracted token:', token.substring(0, 20) + '...');
+      jwt.verify(token, getKey, { algorithms: ['RS256'] }, (err, decoded) => {
+        if (err) {
+          log('Token validation failed:', err.message);
+          res.writeHead(401, { 'WWW-Authenticate': 'Bearer' });
+          res.end('Invalid token');
+        } else {
+          log('Token validated successfully. Decoded payload:', JSON.stringify(decoded));
+          res.writeHead(200);
+          res.end('Valid token');
+        }
+      });
+    });
+
+    server.listen(3000, () => log('JWT Validator running on port 3000'));
+  package.json: |
+    {
+      "dependencies": {
+        "jsonwebtoken": "^9.0.2",
+        "jwks-rsa": "^3.1.0"
+      }
+    }

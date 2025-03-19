@@ -1,0 +1,102 @@
+name: Deploy Ticket Booking Service
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REGISTRY: 242201290994.dkr.ecr.eu-central-1.amazonaws.com
+  ECR_REPOSITORY: java-app
+  CLUSTER_NAME: ticket-booking-k8s.obsessionforlearning.com
+  STATE_STORE: s3://ticket-booking-k8s
+
+jobs:
+  build-and-deploy:
+    name: Build Spring Boot App, Push to ECR & Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Build the Spring Boot JAR
+        run: |
+          mvn clean package -DskipTests
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+
+      - name: Build & Push Docker Image
+        run: |
+          IMAGE_TAG=${{ github.sha }}  # Unique commit SHA tag
+          
+          # Create a new builder instance
+          docker buildx create --use
+          
+          # Build and push the image, AND save a local copy
+          docker buildx build --platform linux/amd64 \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --output=type=docker . 
+          
+          # Push the image to ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Install Kops
+        run: |
+          curl -LO https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64
+          chmod +x kops-linux-amd64
+          sudo mv kops-linux-amd64 /usr/local/bin/kops
+
+      - name: Export Kops Cluster Configuration
+        run: |
+          export KOPS_STATE_STORE=$STATE_STORE
+          kops export kubecfg --name $CLUSTER_NAME --state=$STATE_STORE --admin
+          kubectl version --client
+
+      - name: Create ConfigMap from GitHub Secrets
+        run: |
+          kubectl create configmap ticket-booking-config \
+            --from-literal=SPRING_RABBITMQ_HOST=${{ secrets.SPRING_RABBITMQ_HOST }} \
+            --from-literal=SPRING_RABBITMQ_PORT="5672" \
+            --from-literal=SPRING_RABBITMQ_USERNAME=${{ secrets.SPRING_RABBITMQ_USERNAME }} \
+            --from-literal=SPRING_RABBITMQ_PASSWORD=${{ secrets.SPRING_RABBITMQ_PASSWORD }} \
+            --from-literal=ZEEBE_CLIENT_CLOUD_REGION=${{ secrets.ZEEBE_CLIENT_CLOUD_REGION }} \
+            --from-literal=CAMUNDA_CLIENT_MODE=${{ secrets.CAMUNDA_CLIENT_MODE }} \
+            --from-literal=ZEEBE_CLIENT_CLOUD_CLUSTER_ID=${{ secrets.ZEEBE_CLIENT_CLOUD_CLUSTER_ID }} \
+            --from-literal=ZEEBE_CLIENT_CLOUD_CLIENT_ID=${{ secrets.ZEEBE_CLIENT_CLOUD_CLIENT_ID }} \
+            --from-literal=ZEEBE_CLIENT_CLOUD_CLIENT_SECRET=${{ secrets.ZEEBE_CLIENT_CLOUD_CLIENT_SECRET }} \
+            --from-literal=TICKET_SERVICE_ENDPOINT=${{ secrets.TICKET_SERVICE_ENDPOINT }} \
+            --from-literal=JAVA_TOOL_OPTIONS="-Xmx400m -Xms256m" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to Kubernetes
+        run: |
+          # Replace the placeholder with the actual commit SHA
+          sed -i "s/LATEST_SHA/${{ github.sha }}/g" k8s/ticket-booking.yaml
+
+          # Apply Kubernetes manifests
+          kubectl apply -f k8s/ticket-booking.yaml
+
+          # Restart deployment to use the latest image
+          kubectl rollout restart deployment/ticket-booking
+
+      - name: Check Deployment Status
+        run: |
+          kubectl rollout status deployment/ticket-booking
+          kubectl get pods

@@ -1,0 +1,95 @@
+name: CPU Stress Test
+
+on:
+  workflow_dispatch:
+
+env:
+  CLUSTER_NAME: ticket-booking-k8s.obsessionforlearning.com
+  STATE_STORE: s3://ticket-booking-k8s
+  DEPLOYMENTS: "ticket-booking rabbitmq fake-services"
+  NAMESPACE: default
+
+jobs:
+  cpu-stress-test:
+    name: CPU Stress Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Install Kops
+        run: |
+          curl -LO https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64
+          chmod +x kops-linux-amd64
+          sudo mv kops-linux-amd64 /usr/local/bin/kops
+
+      - name: Export Kops Cluster Configuration
+        run: |
+          export KOPS_STATE_STORE=$STATE_STORE
+          kops export kubecfg --name $CLUSTER_NAME --state=$STATE_STORE --admin
+          kubectl version --client
+
+      - name: Show HPA Status Before Testing
+        run: |
+          echo "HPA status before testing:"
+          kubectl get hpa
+
+      - name: Stress Test Deployments
+        run: |
+          for DEPLOYMENT in $DEPLOYMENTS; do
+            echo "Finding a running pod for deployment: $DEPLOYMENT..."
+            POD_NAME=$(kubectl get pods -n $NAMESPACE -l app=$DEPLOYMENT -o jsonpath='{.items[0].metadata.name}')
+            if [ -z "$POD_NAME" ]; then
+              echo "No running pod found for $DEPLOYMENT. Skipping..."
+              continue
+            fi
+
+            echo "Using pod: $POD_NAME"
+            echo "Starting CPU stress test for deployment: $DEPLOYMENT"
+
+            kubectl exec -n $NAMESPACE $POD_NAME -- /bin/sh -c "
+              yes > /dev/null & yes > /dev/null;
+              sleep 15;
+              killall yes
+            " &
+
+            stress_start=$(date +%s)
+            stress_end=$((stress_start + 10))
+
+            while [ $(date +%s) -lt $stress_end ]; do
+              echo "HPA status during stress test for $DEPLOYMENT:"
+              kubectl get hpa || echo "Failed to get HPA status"
+              sleep 10
+            done
+          done
+
+      - name: Show HPA Status After Testing
+        run: |
+          echo "HPA status immediately after stress test:"
+          kubectl get hpa
+
+      - name: Cooldown Period (4 min) - Monitoring HPA
+        run: |
+          echo "Waiting for 4 minutes to observe HPA scaling down..."
+          cooldown_start=$(date +%s)
+          cooldown_end=$((cooldown_start + 240))
+
+          while [ $(date +%s) -lt $cooldown_end ]; do
+            remaining=$((cooldown_end - $(date +%s)))
+            echo "Time left in cooldown: ${remaining} seconds"
+            kubectl get hpa || echo "Failed to get HPA status"
+            sleep 10
+          done
+
+      - name: Show Final HPA Status
+        run: |
+          echo "Final HPA status after cooldown:"
+          kubectl get hpa

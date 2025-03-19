@@ -1,0 +1,63 @@
+name: Deploy Utils
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-central-1
+  CLUSTER_NAME: ticket-booking-k8s.obsessionforlearning.com
+  STATE_STORE: s3://ticket-booking-k8s
+
+jobs:
+  deploy-kubernetes-resources:
+    name: Deploy Kubernetes Resources
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Kops
+        run: |
+          curl -LO https://github.com/kubernetes/kops/releases/latest/download/kops-linux-amd64
+          chmod +x kops-linux-amd64
+          sudo mv kops-linux-amd64 /usr/local/bin/kops
+
+      - name: Export Kops Cluster Configuration
+        run: |
+          export KOPS_STATE_STORE=$STATE_STORE
+          kops export kubecfg --name $CLUSTER_NAME --state=$STATE_STORE --admin
+          kubectl version --client
+
+      - name: Deploy Utilities
+        run: |
+          # Apply Kubernetes resources
+          kubectl apply -f k8s/jwt-validator.yaml
+          kubectl apply -f k8s/rabbitmq.yaml
+          kubectl apply -f k8s/prometheus.yaml
+          kubectl apply -f k8s/cluster-autoscaler.yaml
+
+      - name: Restart Deployments
+        run: |
+          # Restart deployments to apply any updates immediately
+          kubectl rollout restart deployment -n monitoring prometheus-adapter
+          kubectl rollout restart deployment -n monitoring prometheus
+          kubectl rollout restart deployment -n default jwt-validator
+          kubectl rollout restart deployment -n default rabbitmq
+          kubectl rollout restart deployment -n kube-system cluster-autoscaler
+
+      - name: Verify Rollouts
+        run: |
+          # Wait for all deployments to become ready
+          kubectl rollout status deployment -n monitoring prometheus-adapter
+          kubectl rollout status deployment -n monitoring prometheus
+          kubectl rollout status deployment -n default jwt-validator
+          kubectl rollout status deployment -n default rabbitmq
+          kubectl rollout status deployment -n kube-system cluster-autoscaler
